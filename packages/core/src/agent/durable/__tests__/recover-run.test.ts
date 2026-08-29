@@ -163,6 +163,28 @@ describe('DurableAgent.recover(runId)', () => {
     cleanup();
   });
 
+  it('rehydrates the signal drain for signals delivered after recovery', async () => {
+    const runId = 'run-recovered-signal';
+    await seed(store, runId, 'running', 'agent-A');
+    stubWorkflow(agent, 'success');
+
+    const recovered = await agent.recover(runId);
+    const signal = agent.sendSignal(
+      { type: 'user-message', contents: 'after restart' },
+      { runId, resourceId: 'r', threadId: 't' },
+    );
+
+    await expect(signal.accepted).resolves.toMatchObject({ action: 'deliver', runId });
+    const drainPendingSignals = globalRunRegistry.get(runId)?.drainPendingSignals;
+    expect(drainPendingSignals).toBeTypeOf('function');
+    expect(drainPendingSignals?.('pending')).toEqual([
+      expect.objectContaining({ type: 'user', contents: 'after restart' }),
+    ]);
+
+    await globalRunRegistry.get(runId)?.workflowExecution;
+    recovered.cleanup();
+  });
+
   it('re-reads the authoritative snapshot after acquiring recovery ownership', async () => {
     const runId = 'run-fresh-snapshot';
     await seed(store, runId, 'running', 'agent-A');
