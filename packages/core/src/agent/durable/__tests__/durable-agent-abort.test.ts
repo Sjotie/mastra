@@ -15,6 +15,7 @@ import type { LanguageModelV2 } from '@ai-sdk/provider-v5';
 import { MockLanguageModelV2 } from '@internal/ai-sdk-v5/test';
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { EventEmitterPubSub } from '../../../events/event-emitter';
+import { MockMemory } from '../../../memory/mock';
 import { Agent } from '../../agent';
 import { createDurableAgent } from '../create-durable-agent';
 
@@ -160,6 +161,73 @@ describe('DurableAgent abort signal', () => {
     }
 
     expect(abortPayload?.text).toBe('Hello');
+
+    cleanup();
+  });
+
+  it('persists the text streamed before the abort', async () => {
+    const partialText = 'This text was already visible before abort.';
+    const mockModel = new MockLanguageModelV2({
+      doStream: async ({ abortSignal }: { abortSignal?: AbortSignal }) => ({
+        stream: new ReadableStream({
+          start(controller) {
+            controller.enqueue({ type: 'stream-start', warnings: [] });
+            controller.enqueue({
+              type: 'response-metadata',
+              id: 'id-0',
+              modelId: 'mock-model-id',
+              timestamp: new Date(0),
+            });
+            controller.enqueue({ type: 'text-start', id: 'text-1' });
+            controller.enqueue({ type: 'text-delta', id: 'text-1', delta: partialText });
+            abortSignal?.addEventListener(
+              'abort',
+              () => {
+                const err = new Error('Aborted');
+                err.name = 'AbortError';
+                controller.error(err);
+              },
+              { once: true },
+            );
+          },
+        }),
+        rawCall: { rawPrompt: null, rawSettings: {} },
+      }),
+    });
+    const memory = new MockMemory();
+    const baseAgent = new Agent({
+      id: 'abort-persist-partial-text-agent',
+      name: 'Abort Persist Partial Text Agent',
+      instructions: 'Test',
+      model: mockModel as LanguageModelV2,
+      memory,
+    });
+    const durableAgent = createDurableAgent({ agent: baseAgent, pubsub });
+    const threadId = 'abort-persist-partial-text-thread';
+    const resourceId = 'abort-persist-partial-text-resource';
+
+    const { output, runId, cleanup } = await durableAgent.stream('Go', {
+      memory: { thread: threadId, resource: resourceId },
+    });
+
+    const reader = output.fullStream.getReader();
+    for (;;) {
+      const next = await reader.read();
+      expect(next.done).toBe(false);
+      if (next.value?.type === 'text-delta' && next.value.payload?.text === partialText) break;
+    }
+
+    expect(durableAgent.abortRunStream(runId)).toBe(true);
+    for (;;) {
+      const next = await reader.read();
+      if (next.done) break;
+    }
+    reader.releaseLock();
+    await output.text;
+
+    const { messages } = await memory.recall({ threadId, resourceId });
+    const assistant = messages.find(message => message.role === 'assistant');
+    expect(JSON.stringify(assistant?.content)).toContain(partialText);
 
     cleanup();
   });
