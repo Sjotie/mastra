@@ -163,6 +163,52 @@ describe('DurableAgent.recover(runId)', () => {
     cleanup();
   });
 
+  it('rehydrates dynamic fallback models with their persisted ids', async () => {
+    const runId = 'run-dynamic-fallback';
+    const disabledModel = makeMockModel();
+    const primaryModel = makeMockModel();
+    const fallbackModel = makeMockModel();
+    const fallbackAgent = new Agent({
+      id: 'agent-fallback',
+      name: 'agent-fallback',
+      instructions: 'x',
+      model: () => [
+        { model: disabledModel, enabled: false },
+        { model: primaryModel, maxRetries: 0 },
+        { model: fallbackModel, maxRetries: 0 },
+      ],
+    });
+    const durable = createDurableAgent({ agent: fallbackAgent });
+    const fallbackStore = new InMemoryStore();
+    void new Mastra({ agents: { fallbackAgent: durable as any }, storage: fallbackStore });
+
+    const prepared = await durable.prepare('hello', { runId });
+    const snapshot = makeSnapshot(runId, 'running', durable.id);
+    snapshot.context.input = prepared.workflowInput as any;
+    const workflows = (await fallbackStore.getStore('workflows'))!;
+    for (const workflowName of [DurableStepIds.AGENTIC_LOOP, DurableStepIds.AGENTIC_EXECUTION]) {
+      await workflows.persistWorkflowSnapshot({
+        workflowName,
+        runId,
+        resourceId: prepared.resourceId,
+        snapshot,
+      });
+    }
+
+    globalRunRegistry.delete(runId);
+    durable.runRegistry.cleanup(runId);
+    stubWorkflow(durable, 'success');
+
+    const recovered = await durable.recover(runId);
+    const recoveredModels = globalRunRegistry.get(runId)?.modelList;
+
+    expect(recoveredModels?.map(entry => entry.id)).toEqual(prepared.workflowInput.modelList?.map(entry => entry.id));
+    expect(recoveredModels?.map(entry => entry.model)).toEqual([primaryModel, fallbackModel]);
+
+    await globalRunRegistry.get(runId)?.workflowExecution;
+    recovered.cleanup();
+  });
+
   it('re-reads the authoritative snapshot after acquiring recovery ownership', async () => {
     const runId = 'run-fresh-snapshot';
     await seed(store, runId, 'running', 'agent-A');
