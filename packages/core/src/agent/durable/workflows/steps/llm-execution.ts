@@ -928,7 +928,7 @@ export function createDurableLLMExecutionStep(_options?: DurableLLMExecutionStep
             });
             modelSpanTracker?.startInference?.();
 
-            // Collect chunks for post-stream message building (via
+            // Collect chunks for terminal response message building (via
             // buildMessagesFromChunks) and for the processLLMResponse hook
             // (pairs with processLLMRequest — lets processors like
             // ResponseCache persist the model's response). Always populated
@@ -936,6 +936,56 @@ export function createDurableLLMExecutionStep(_options?: DurableLLMExecutionStep
             // including empty reasoning spans that carry providerMetadata
             // (e.g. OpenAI itemId) required by subsequent turns (#19365).
             const collectedChunks: CollectedChunk[] = [];
+
+            const materializeCollectedMessages = ({
+              omitUnresolvedToolCalls = false,
+            }: { omitUnresolvedToolCalls?: boolean } = {}) => {
+              let chunks = collectedChunks;
+              if (omitUnresolvedToolCalls) {
+                // The abort return stops the loop before pending tools can execute.
+                // Keep only calls that already have an outcome so a later turn never
+                // replays an assistant tool call without its required result.
+                const settledToolCallIds = new Set(
+                  collectedChunks
+                    .filter(
+                      chunk =>
+                        chunk.type === 'tool-error' || (chunk.type === 'tool-result' && chunk.payload?.result != null),
+                    )
+                    .map(chunk => chunk.payload?.toolCallId),
+                );
+                chunks = collectedChunks.filter(
+                  chunk => chunk.type !== 'tool-call' || settledToolCallIds.has(chunk.payload?.toolCallId),
+                );
+              }
+              const responseModelId = currentModel.modelId ?? responseMetadata?.modelId;
+              const responseTraceId = getRootExportSpan(
+                modelSpanTracker?.getTracingContext()?.currentSpan ?? tracingContext?.currentSpan,
+              )?.externalTraceId;
+              const responseModelMetadata =
+                responseModelId || currentModel.provider || responseTraceId
+                  ? {
+                      metadata: {
+                        ...(responseModelId ? { modelId: responseModelId } : {}),
+                        ...(currentModel.provider ? { provider: currentModel.provider } : {}),
+                        ...(responseTraceId ? { traceId: responseTraceId } : {}),
+                      },
+                    }
+                  : undefined;
+              const builtMessages = buildMessagesFromChunks({
+                chunks,
+                messageId: currentMessageId,
+                tools: currentTools,
+                responseModelMetadata,
+              });
+
+              for (const message of builtMessages) {
+                messageList.add(message, 'response');
+              }
+
+              if (builtMessages.length > 0 && registryEntry) {
+                registryEntry.messageList = messageList;
+              }
+            };
 
             // 10. Execute LLM call (or replay cached response)
             let modelResult: ReturnType<typeof execute>;
@@ -1375,6 +1425,7 @@ export function createDurableLLMExecutionStep(_options?: DurableLLMExecutionStep
               // the canonical AbortError name or an actual aborted signal.
               const isAbort = executionAbortSignal?.aborted === true || errorObj.name === 'AbortError';
               if (isAbort) {
+                materializeCollectedMessages({ omitUnresolvedToolCalls: true });
                 // Return a clean output instead of throwing so the workflow
                 // engine doesn't crash. The dowhile predicate will see
                 // isContinued: false and stop the loop. The FINISH event
@@ -1453,6 +1504,7 @@ export function createDurableLLMExecutionStep(_options?: DurableLLMExecutionStep
               // to be a confirmed abort must short-circuit retry/fallback.
               const isStreamErrorAbort = executionAbortSignal?.aborted === true || streamErrorObj.name === 'AbortError';
               if (isStreamErrorAbort) {
+                materializeCollectedMessages({ omitUnresolvedToolCalls: true });
                 return {
                   messageListState: messageList.serialize(),
                   text: textDeltas.join(''),
@@ -1551,38 +1603,7 @@ export function createDurableLLMExecutionStep(_options?: DurableLLMExecutionStep
             // The traceId link (#19891) mirrors it too: message rows carry no traceId
             // column, so this metadata is the only way a stored assistant message can
             // be correlated back to its trace.
-            const responseModelId = currentModel.modelId ?? responseMetadata?.modelId;
-            const responseTraceId = getRootExportSpan(
-              modelSpanTracker?.getTracingContext()?.currentSpan ?? tracingContext?.currentSpan,
-            )?.externalTraceId;
-            const responseModelMetadata =
-              responseModelId || currentModel.provider || responseTraceId
-                ? {
-                    metadata: {
-                      ...(responseModelId ? { modelId: responseModelId } : {}),
-                      ...(currentModel.provider ? { provider: currentModel.provider } : {}),
-                      ...(responseTraceId ? { traceId: responseTraceId } : {}),
-                    },
-                  }
-                : undefined;
-            const builtMessages = buildMessagesFromChunks({
-              chunks: collectedChunks,
-              messageId: currentMessageId,
-              tools: currentTools,
-              responseModelMetadata,
-            });
-            if (builtMessages.length > 0) {
-              for (const msg of builtMessages) {
-                messageList.add(msg, 'response');
-              }
-
-              // Sync the updated messageList to the in-process registry so
-              // downstream steps (e.g. tool-call.ts's doFlush()) see the
-              // assistant message when persisting before suspension.
-              if (registryEntry) {
-                registryEntry.messageList = messageList;
-              }
-            }
+            materializeCollectedMessages();
 
             // 13. Determine if we should continue (has tool calls)
             const isContinued = toolCalls.length > 0 && finishReason !== 'stop';

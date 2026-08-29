@@ -15,11 +15,12 @@ import type { LanguageModelV2 } from '@ai-sdk/provider-v5';
 import { MockLanguageModelV2 } from '@internal/ai-sdk-v5/test';
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { EventEmitterPubSub } from '../../../events/event-emitter';
+import { MockMemory } from '../../../memory/mock';
 import { Agent } from '../../agent';
 import { createDurableAgent } from '../create-durable-agent';
 
 /** @param onCall - invoked as soon as the model starts streaming, to synchronize on a live run. */
-function createAbortableModel(onCall?: () => void) {
+function createAbortableModel(onCall?: () => void, partialText?: string) {
   return new MockLanguageModelV2({
     doStream: async ({ abortSignal }: { abortSignal?: AbortSignal }) => {
       onCall?.();
@@ -41,6 +42,9 @@ function createAbortableModel(onCall?: () => void) {
               timestamp: new Date(0),
             });
             controller.enqueue({ type: 'text-start', id: 'text-1' });
+            if (partialText) {
+              controller.enqueue({ type: 'text-delta', id: 'text-1', delta: partialText });
+            }
             // Hold the stream open and resolve with an AbortError as soon as
             // the signal fires — the durable step then catches AbortError and
             // emits the abort event to the bridge.
@@ -160,6 +164,123 @@ describe('DurableAgent abort signal', () => {
     }
 
     expect(abortPayload?.text).toBe('Hello');
+
+    cleanup();
+  });
+
+  it('persists the text streamed before the abort', async () => {
+    const partialText = 'This text was already visible before abort.';
+    const memory = new MockMemory();
+    const baseAgent = new Agent({
+      id: 'abort-persist-partial-text-agent',
+      name: 'Abort Persist Partial Text Agent',
+      instructions: 'Test',
+      model: createAbortableModel(undefined, partialText) as LanguageModelV2,
+      memory,
+    });
+    const durableAgent = createDurableAgent({ agent: baseAgent, pubsub });
+    const threadId = 'abort-persist-partial-text-thread';
+    const resourceId = 'abort-persist-partial-text-resource';
+
+    const { output, runId, cleanup } = await durableAgent.stream('Go', {
+      memory: { thread: threadId, resource: resourceId },
+    });
+
+    const reader = output.fullStream.getReader();
+    for (;;) {
+      const next = await reader.read();
+      expect(next.done).toBe(false);
+      if (next.value?.type === 'text-delta' && next.value.payload?.text === partialText) break;
+    }
+
+    expect(durableAgent.abortRunStream(runId)).toBe(true);
+    for (;;) {
+      const next = await reader.read();
+      if (next.done) break;
+    }
+    reader.releaseLock();
+    await output.text;
+
+    const { messages } = await memory.recall({ threadId, resourceId });
+    expect(messages.map(message => message.role)).toEqual(['user', 'assistant']);
+    const assistantParts = (messages[1]?.content as { parts?: unknown[] }).parts;
+    expect(assistantParts).toEqual([expect.objectContaining({ type: 'text', text: partialText })]);
+
+    cleanup();
+  });
+
+  it('does not persist an unresolved tool call when aborting', async () => {
+    const partialText = 'Text before an unresolved tool call.';
+    const mockModel = new MockLanguageModelV2({
+      doStream: async ({ abortSignal }: { abortSignal?: AbortSignal }) => ({
+        stream: new ReadableStream({
+          start(controller) {
+            controller.enqueue({ type: 'stream-start', warnings: [] });
+            controller.enqueue({
+              type: 'response-metadata',
+              id: 'id-0',
+              modelId: 'mock-model-id',
+              timestamp: new Date(0),
+            });
+            controller.enqueue({ type: 'text-start', id: 'text-1' });
+            controller.enqueue({ type: 'text-delta', id: 'text-1', delta: partialText });
+            controller.enqueue({ type: 'text-end', id: 'text-1' });
+            controller.enqueue({
+              type: 'tool-call',
+              toolCallId: 'call-1',
+              toolName: 'pendingTool',
+              input: '{}',
+              providerExecuted: false,
+            });
+            abortSignal?.addEventListener(
+              'abort',
+              () => {
+                const err = new Error('Aborted');
+                err.name = 'AbortError';
+                controller.error(err);
+              },
+              { once: true },
+            );
+          },
+        }),
+        rawCall: { rawPrompt: null, rawSettings: {} },
+      }),
+    });
+    const memory = new MockMemory();
+    const baseAgent = new Agent({
+      id: 'abort-unresolved-tool-agent',
+      name: 'Abort Unresolved Tool Agent',
+      instructions: 'Test',
+      model: mockModel as LanguageModelV2,
+      memory,
+    });
+    const durableAgent = createDurableAgent({ agent: baseAgent, pubsub });
+    const threadId = 'abort-unresolved-tool-thread';
+    const resourceId = 'abort-unresolved-tool-resource';
+
+    const { output, runId, cleanup } = await durableAgent.stream('Go', {
+      memory: { thread: threadId, resource: resourceId },
+    });
+
+    const reader = output.fullStream.getReader();
+    for (;;) {
+      const next = await reader.read();
+      expect(next.done).toBe(false);
+      if (next.value?.type === 'tool-call') break;
+    }
+
+    expect(durableAgent.abortRunStream(runId)).toBe(true);
+    for (;;) {
+      const next = await reader.read();
+      if (next.done) break;
+    }
+    reader.releaseLock();
+    await output.text;
+
+    const { messages } = await memory.recall({ threadId, resourceId });
+    expect(messages.map(message => message.role)).toEqual(['user', 'assistant']);
+    const assistantParts = (messages[1]?.content as { parts?: unknown[] }).parts;
+    expect(assistantParts).toEqual([expect.objectContaining({ type: 'text', text: partialText })]);
 
     cleanup();
   });
