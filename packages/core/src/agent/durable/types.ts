@@ -682,8 +682,9 @@ export interface RunRegistryEntry {
    * - `'pending'` — signals sent while the run is active (between iterations)
    * - `'pre-run'` — signals sent before the first model request
    *
-   * Non-serializable (a closure); cross-process engines cannot recover it and
-   * signals sent to a restarted worker will not be drained.
+   * Non-serializable. DurableAgent.recover() rebinds it in-process against the
+   * recovered run's thread-runtime PubSub. Other cross-process engines cannot
+   * recover it.
    */
   drainPendingSignals?: (scope?: 'pending' | 'pre-run') => CreatedAgentSignal[];
   /**

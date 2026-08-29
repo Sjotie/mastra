@@ -68,12 +68,13 @@ function makeMockModel(): LanguageModelV2 {
   }) as unknown as LanguageModelV2;
 }
 
-function createDurableWithStore(agentId: string, store = new InMemoryStore(), pubsub?: PubSub) {
+function createDurableWithStore(agentId: string, store = new InMemoryStore(), pubsub?: PubSub, wrappedPubsub?: PubSub) {
   const baseAgent = new Agent({
     id: agentId,
     name: agentId,
     instructions: 'x',
     model: makeMockModel(),
+    ...(wrappedPubsub ? { pubsub: wrappedPubsub } : {}),
   });
   const agent = createDurableAgent({ agent: baseAgent, pubsub, ...(pubsub ? { cache: false } : {}) });
   void new Mastra({
@@ -165,11 +166,15 @@ describe('DurableAgent.recover(runId)', () => {
 
   it('rehydrates the signal drain for signals delivered after recovery', async () => {
     const runId = 'run-recovered-signal';
-    await seed(store, runId, 'running', 'agent-A');
-    stubWorkflow(agent, 'success');
+    const durablePubsub = new EventEmitterPubSub();
+    const wrappedPubsub = new EventEmitterPubSub();
+    const signalStore = new InMemoryStore();
+    const { agent: signalAgent } = createDurableWithStore('signal-agent', signalStore, durablePubsub, wrappedPubsub);
+    await seed(signalStore, runId, 'running', 'signal-agent');
+    stubWorkflow(signalAgent, 'success');
 
-    const recovered = await agent.recover(runId);
-    const signal = agent.sendSignal(
+    const recovered = await signalAgent.recover(runId);
+    const signal = signalAgent.sendSignal(
       { type: 'user-message', contents: 'after restart' },
       { runId, resourceId: 'r', threadId: 't' },
     );
@@ -178,11 +183,12 @@ describe('DurableAgent.recover(runId)', () => {
     const drainPendingSignals = globalRunRegistry.get(runId)?.drainPendingSignals;
     expect(drainPendingSignals).toBeTypeOf('function');
     expect(drainPendingSignals?.('pending')).toEqual([
-      expect.objectContaining({ type: 'user-message', contents: 'after restart' }),
+      expect.objectContaining({ type: 'user', contents: 'after restart' }),
     ]);
 
     await globalRunRegistry.get(runId)?.workflowExecution;
     recovered.cleanup();
+    await Promise.all([durablePubsub.close(), wrappedPubsub.close()]);
   });
 
   it('re-reads the authoritative snapshot after acquiring recovery ownership', async () => {

@@ -1024,6 +1024,7 @@ export class DurableAgent<
         outputProcessors,
         errorProcessors,
         processorStates,
+        drainPendingSignals: (scope?: 'pending' | 'pre-run') => this.__getDrainPendingSignals()(runId, scope),
         cleanup: () => {},
       },
     };
