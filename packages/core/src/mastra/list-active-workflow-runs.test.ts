@@ -1,5 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import { z } from 'zod/v4';
+import { Agent } from '../agent';
+import { createDurableAgent } from '../agent/durable/create-durable-agent';
 import type { WorkflowRuns } from '../storage';
 import { MockStore } from '../storage/mock';
 import { createEmptyWorkflowSnapshot } from '../storage/workflow-snapshot';
@@ -112,5 +114,48 @@ describe('Mastra listActiveWorkflowRuns', () => {
       runs: [...firstRunning.runs, ...firstWaiting.runs, ...secondRunning.runs, ...secondWaiting.runs],
       total: 4,
     });
+  });
+});
+
+describe('Mastra restartAllActiveWorkflowRuns', () => {
+  it('does not restart durable-agent-owned workflows through generic workflow recovery', async () => {
+    const userWorkflow = createWorkflow({
+      id: 'user-workflow',
+      inputSchema: z.object({}),
+      outputSchema: z.object({}),
+    }).commit();
+    const durableAgent = createDurableAgent({
+      agent: new Agent({
+        id: 'durable-agent',
+        name: 'Durable agent',
+        instructions: 'Test agent',
+        model: 'openai/gpt-4o',
+      }),
+    });
+    const mastra = new Mastra({
+      logger: false,
+      storage: new MockStore(),
+      workflows: { userWorkflow },
+      agents: { durableAgent: durableAgent as any },
+    });
+    const durableWorkflow = durableAgent.getWorkflow();
+
+    vi.spyOn(userWorkflow, 'listActiveWorkflowRuns').mockResolvedValue({
+      runs: [createWorkflowRun(userWorkflow.id, 'user-run', 'running')],
+      total: 1,
+    });
+    vi.spyOn(durableWorkflow, 'listActiveWorkflowRuns').mockResolvedValue({
+      runs: [createWorkflowRun(durableWorkflow.id, 'durable-run', 'running')],
+      total: 1,
+    });
+    const userRestart = vi.fn().mockResolvedValue({ status: 'success' });
+    const durableRestart = vi.fn().mockResolvedValue({ status: 'success' });
+    vi.spyOn(userWorkflow, 'createRun').mockResolvedValue({ restart: userRestart } as any);
+    vi.spyOn(durableWorkflow, 'createRun').mockResolvedValue({ restart: durableRestart } as any);
+
+    await mastra.restartAllActiveWorkflowRuns();
+
+    expect(userRestart).toHaveBeenCalledOnce();
+    expect(durableRestart).not.toHaveBeenCalled();
   });
 });

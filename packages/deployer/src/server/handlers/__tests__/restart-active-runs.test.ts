@@ -11,6 +11,23 @@ function createContext(mastra: Mastra) {
 }
 
 describe('restartAllActiveWorkflowRunsHandler', () => {
+  it('starts generic workflow recovery but not dedicated durable recovery when disabled', async () => {
+    const restartAllActiveWorkflowRuns = vi.fn(() => Promise.resolve());
+    const recoverAllDurableAgents = vi.fn(() => Promise.resolve());
+    const mastra = {
+      restartAllActiveWorkflowRuns,
+      recoverAllDurableAgents,
+      getLogger: vi.fn(() => ({ error: vi.fn() })),
+      recoveryConfig: { durableAgents: 'off' },
+    } as unknown as Mastra;
+
+    const response = await restartAllActiveWorkflowRunsHandler(createContext(mastra));
+
+    expect(response.status).toBe(200);
+    expect(restartAllActiveWorkflowRuns).toHaveBeenCalledOnce();
+    expect(recoverAllDurableAgents).not.toHaveBeenCalled();
+  });
+
   it('logs a rejected background workflow restart without failing the request', async () => {
     const error = new Error('storage unavailable');
     const logger = { error: vi.fn() };
